@@ -1,0 +1,141 @@
+name: Targeted remediation validation
+on:
+  push:
+    branches: ['remediation-ci/keploy-*']
+permissions:
+  contents: read
+concurrency:
+  group: keploy-remediation-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  BASE_SHA: e7a74a4d773b45f57fc9c6148995cfa560414391
+  CGO_ENABLED: '1'
+  GOMAXPROCS: '4'
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: '4564'
+            source: 92beb7487862535e0bf999724d72ae1a9c7833a8
+            packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
+            race_pattern: 'TestMappingDb_DeleteClearsStaleMappings|TestRecord_KeepsMockEmittedAfterRunnerExit'
+            race_packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
+            lint_packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
+          - pr: '4557'
+            source: 174f0b05296d6f4c7ec484784319080dae6e9555
+            packages: ./cli ./pkg/service/tools .
+            race_pattern: '^TestToolsCommandsReturnErrorOnFailure$'
+            race_packages: ./cli
+            lint_packages: ./cli
+    env:
+      SOURCE_SHA: ${{ matrix.source }}
+      PR_NUMBER: ${{ matrix.pr }}
+      TEST_PACKAGES: ${{ matrix.packages }}
+      RACE_PACKAGES: ${{ matrix.race_packages }}
+      RACE_PATTERN: ${{ matrix.race_pattern }}
+    steps:
+      - name: Check out exact implementation
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ matrix.source }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record exact source and check formatting
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          mkdir -p .remediation-validation
+          git rev-parse HEAD > .remediation-validation/source-sha.txt
+          git diff --stat "$BASE_SHA"...HEAD > .remediation-validation/scope.txt
+      - name: Prepare repository Go version
+        id: go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+      - name: Full relevant units and focused race tests
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          out = pathlib.Path('.remediation-validation')
+          names = subprocess.check_output(['git', 'diff', '--name-only', '-z', os.environ['BASE_SHA'] + '...HEAD', '--', '*.go']).decode().split('\0')
+          for name in filter(None, names):
+              assert subprocess.check_output(['gofmt', name]) == pathlib.Path(name).read_bytes(), name
+          commands = [
+              ('units', ['go', 'test', '-json', '-tags', 'viper_bind_struct', '-p', '4', '-parallel', '4', '-count=1', '-timeout', '15m'] + os.environ['TEST_PACKAGES'].split()),
+              ('race', ['go', 'test', '-race', '-json', '-tags', 'viper_bind_struct', '-p', '4', '-count=1', '-timeout', '5m', '-run', os.environ['RACE_PATTERN']] + os.environ['RACE_PACKAGES'].split()),
+          ]
+          rows = []
+          for name, command in commands:
+              path = out / (name + '.jsonl')
+              with path.open('wb') as log:
+                  result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+              counts = {'pass': 0, 'fail': 0, 'skip': 0}
+              failed = []
+              for line in path.read_text(errors='replace').splitlines():
+                  try: event = json.loads(line)
+                  except ValueError: continue
+                  if event.get('Test') and event.get('Action') in counts:
+                      counts[event['Action']] += 1
+                      if event['Action'] == 'fail': failed.append(event['Test'])
+              row = {'name': name, 'exit_code': result.returncode, 'test_events': counts, 'failed': failed}
+              rows.append(row)
+              (out / 'tests-summary.json').write_text(json.dumps(rows, indent=2))
+              print(json.dumps(row), flush=True)
+              if result.returncode:
+                  print(path.read_text(errors='replace')[-12000:])
+                  sys.exit(result.returncode)
+          PY
+      - name: Prove regression coverage
+        if: always() && steps.go.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          out = pathlib.Path('.remediation-validation')
+          if os.environ['PR_NUMBER'] == '4557':
+              paths = [pathlib.Path('cli/' + name + '.go') for name in ['diff', 'export', 'import', 'normalise', 'sanitize', 'templatize']]
+              changes = {p: subprocess.check_output(['git', 'show', os.environ['BASE_SHA'] + ':' + str(p)]) for p in paths}
+              command = ['go', 'test', '-v', '-tags', 'viper_bind_struct', '-count=1', '-timeout', '2m', './cli', '-run', '^TestToolsCommandsReturnErrorOnFailure$']
+              expected = 'FAIL: TestToolsCommandsReturnErrorOnFailure'
+          else:
+              p = pathlib.Path('pkg/service/mock/record.go')
+              content = p.read_bytes()
+              call = b'\tm.deleteMappings(persistCtx, name)'
+              assert content.count(call) == 1
+              changes = {p: content.replace(call, b'\t// Regression control: omit stale-mapping cleanup.')}
+              command = ['go', 'test', '-v', '-tags', 'viper_bind_struct', '-count=1', '-timeout', '2m', './pkg/service/mock', '-run', '^TestRecord_KeepsMockEmittedAfterRunnerExit$']
+              expected = 'FAIL: TestRecord_KeepsMockEmittedAfterRunnerExit'
+          original = {p: p.read_bytes() for p in changes}
+          try:
+              for p, content in changes.items(): p.write_bytes(content)
+              path = out / 'regression-control.log'
+              with path.open('wb') as log:
+                  result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+              body = path.read_text(errors='replace')
+              assert result.returncode != 0 and expected in body, body[-12000:]
+              print(json.dumps({'regression_control': 'expected failure', 'pr': os.environ['PR_NUMBER']}))
+          finally:
+              for p, content in original.items(): p.write_bytes(content)
+          subprocess.run(['git', 'diff', '--exit-code', '--', '*.go', 'go.mod', 'go.sum'], check=True)
+          PY
+      - name: Lint changed packages using repository configuration
+        if: always() && steps.go.outcome == 'success'
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa
+        with:
+          version: v2.14.0
+          only-new-issues: false
+          args: --timeout=5m --build-tags=viper_bind_struct --new-from-rev=${{ env.BASE_SHA }} ${{ matrix.lint_packages }}
+      - name: Verify source restoration
+        if: always()
+        run: git diff --exit-code -- '*.go' go.mod go.sum
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: keploy-remediation-${{ matrix.pr }}
+          path: .remediation-validation
+          include-hidden-files: true
+          retention-days: 7
