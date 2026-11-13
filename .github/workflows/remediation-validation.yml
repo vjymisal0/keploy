@@ -8,7 +8,7 @@ concurrency:
   group: keploy-remediation-${{ github.sha }}
   cancel-in-progress: false
 env:
-  BASE_SHA: e7a74a4d773b45f57fc9c6148995cfa560414391
+  BASE_SHA: 50d501c7e2917aad15735691451222165c6c59ab
   CGO_ENABLED: '1'
   GOMAXPROCS: '4'
 jobs:
@@ -20,13 +20,13 @@ jobs:
       matrix:
         include:
           - pr: '4564'
-            source: 92beb7487862535e0bf999724d72ae1a9c7833a8
+            source: b6530d2f5bec335285a176b66e0457770dd4691d
             packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
             race_pattern: 'TestMappingDb_DeleteClearsStaleMappings|TestRecord_KeepsMockEmittedAfterRunnerExit'
             race_packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
             lint_packages: ./pkg/platform/yaml/mapdb ./pkg/service/mock
           - pr: '4557'
-            source: 174f0b05296d6f4c7ec484784319080dae6e9555
+            source: 0755bc8947facef5f8c79f84637ffbe6202d277b
             packages: ./cli ./pkg/service/tools .
             race_pattern: '^TestToolsCommandsReturnErrorOnFailure$'
             race_packages: ./cli
